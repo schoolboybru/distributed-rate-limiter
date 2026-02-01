@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -51,4 +52,51 @@ func (tb *TokenBucket) Allow(requested int) bool {
 	}
 
 	return false
+}
+
+// Wait blocks until the requested tokens are available or the context is cancelled.
+// Returns ErrExceedsCapacity if requested tokens exceed bucket capacity.
+// Returns ctx.Err() if context is cancelled or times out while waiting.
+func (tb *TokenBucket) Wait(ctx context.Context, requested int) error {
+	if float64(requested) > tb.capacity {
+		return ErrExceedsCapacity
+	}
+
+	for {
+		tb.mu.Lock()
+
+		tb.refill()
+		if tb.tokens >= float64(requested) {
+			tb.tokens -= float64(requested)
+			tb.mu.Unlock()
+			return nil
+		}
+
+		waitDuration := tb.timeUntilAvailable(requested)
+		tb.mu.Unlock()
+
+		timer := time.NewTimer(waitDuration)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			// Continue loop to try again
+		}
+	}
+}
+
+// timeUntilAvailable calculates the duration until the requested tokens are available
+// Must be called with tb.mu held.
+func (tb *TokenBucket) timeUntilAvailable(requested int) time.Duration {
+	tb.refill()
+
+	deficit := float64(requested) - tb.tokens
+
+	if deficit <= 0 {
+		return 0
+	}
+
+	seconds := deficit / tb.refillRate
+	return time.Duration(seconds * float64(time.Second))
 }
