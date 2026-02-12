@@ -20,3 +20,17 @@ type Limiter interface {
 	Allow(key string, tokens int) bool
 	Wait(ctx context.Context, key string, tokens int) error
 }
+
+type Metrics interface {
+	OnAllow(key string)
+	OnDeny(key string)
+	OnError(key string, err error)
+	OnLatency(key string, d time.Duration)
+}
+
+type NoopMetrics struct{}
+
+func (NoopMetrics) OnAllow(key string)                    {}
+func (NoopMetrics) OnDeny(key string)                     {}
+func (NoopMetrics) OnError(key string, err error)         {}
+func (NoopMetrics) OnLatency(key string, d time.Duration) {}

@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,38 @@ import (
 
 	"github.com/redis/go-redis/v9"
 )
+
+type MockMetrics struct {
+	mu        sync.Mutex
+	allows    []string
+	denies    []string
+	errors    []string
+	latencies []time.Duration
+}
+
+func (m *MockMetrics) OnAllow(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.allows = append(m.allows, key)
+}
+
+func (m *MockMetrics) OnDeny(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.denies = append(m.denies, key)
+}
+
+func (m *MockMetrics) OnError(key string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.errors = append(m.errors, key)
+}
+
+func (m *MockMetrics) OnLatency(key string, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.latencies = append(m.latencies, d)
+}
 
 func setupTestRedis(t *testing.T) *redis.Client {
 	client := redis.NewClient(&redis.Options{
@@ -146,5 +179,98 @@ func TestAllow_ConcurrentRedis(t *testing.T) {
 
 	if allowed != 10 {
 		t.Errorf("expected 10 allowed, got %d", allowed)
+	}
+}
+
+func TestMetrics_OnAllowCalled(t *testing.T) {
+	client := setupTestRedis(t)
+	key := "test:metrics:allow"
+	defer cleanupKey(t, client, "ratelimit:"+key)
+
+	metrics := &MockMetrics{}
+	limiter := NewRedisLimiter(client, 5, 1, "ratelimit:", WithMetrics(metrics))
+
+	limiter.Allow(key, 3)
+
+	if !slices.Contains(metrics.allows, key) {
+		t.Error("expected metrics.allows to contain the key")
+	}
+
+	if len(metrics.latencies) != 1 {
+		t.Errorf("expected metrics.latencies to have 1 entry, go %d", len(metrics.latencies))
+	}
+}
+
+func TestMetrics_OnDenyCalled(t *testing.T) {
+	client := setupTestRedis(t)
+	key := "test:metrics:deny"
+	defer cleanupKey(t, client, "ratelimit:"+key)
+
+	metrics := &MockMetrics{}
+	limiter := NewRedisLimiter(client, 5, 1, "ratelimit:", WithMetrics(metrics))
+
+	limiter.Allow(key, 5)
+	limiter.Allow(key, 1)
+	if !slices.Contains(metrics.denies, key) {
+		t.Error("expected metrics.denies to contain the key")
+	}
+}
+func TestFailOpen_AllowsWhenRedisDown(t *testing.T) {
+	// Create client pointing to non-existent Redis
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:9999", // wrong port
+	})
+	limiter := NewRedisLimiter(client, 5, 1, "ratelimit:", WithFailureMode(FailOpen))
+
+	if !limiter.Allow("ErrorKey", 5) {
+		t.Error("expected allow to be true for non-existent redis client with FailOpen")
+	}
+}
+func TestFailClosed_DeniesWhenRedisDown(t *testing.T) {
+	// Create client pointing to non-existent Redis
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:9999", // wrong port
+	})
+	limiter := NewRedisLimiter(client, 5, 1, "ratelimit:", WithFailureMode(FailClosed))
+
+	if limiter.Allow("ErrorKey", 5) {
+		t.Error("expected allow to be false for non-existent redis client with FailClosed")
+	}
+}
+func TestFailDegrade_UsesLocalLimiter(t *testing.T) {
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:9999",
+	})
+	limiter := NewRedisLimiter(client, 5, 0, "ratelimit:", WithFailureMode(FailDegrade))
+
+	limiter.Allow("Degrade", 1)
+	limiter.Allow("Degrade", 1)
+	limiter.Allow("Degrade", 1)
+	limiter.Allow("Degrade", 1)
+	limiter.Allow("Degrade", 1)
+
+	if limiter.Allow("Degrade", 1) {
+		t.Error("expected allow to be false for FailDegrade and using local limiter")
+	}
+}
+func TestCircuitBreaker_IntegrationFailsFast(t *testing.T) {
+	// Create client pointing to non-existent Redis
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:9999", // wrong port
+	})
+	metrics := &MockMetrics{}
+	limiter := NewRedisLimiter(client, 5, 1, "ratelimit:",
+		WithCircuitBreaker(3, 30*time.Second),
+		WithMetrics(metrics),
+	)
+
+	limiter.Allow("Fail", 1)
+	limiter.Allow("Fail", 1)
+	limiter.Allow("Fail", 1)
+
+	limiter.Allow("Fail", 1)
+
+	if len(metrics.errors) < 4 {
+		t.Errorf("expected at least 4 errors, got %d", len(metrics.errors))
 	}
 }
