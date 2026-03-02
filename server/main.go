@@ -5,16 +5,25 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/schoolboybru/distributed-rate-limiter/limiter"
 )
 
 func main() {
-	bucket := limiter.NewTokenBucket(5, 1, limiter.RealClock{})
+	registry := prometheus.NewRegistry()
+
+	metrics := limiter.NewPrometheusMetrics(registry, "ratelimiter")
+
+	partitionLimiter := limiter.NewStaticPartitionLimiter(5, 1, 2, limiter.WithPartitionMetrics(metrics))
+
+	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 
 	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		if !bucket.Allow(1) {
+		if !partitionLimiter.Allow("default", 1) {
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte("Rate limited! Try again later.\n"))
+			return
 		}
 		w.Write([]byte("pong\n"))
 	})
@@ -23,9 +32,10 @@ func main() {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		if err := bucket.Wait(ctx, 1); err != nil {
+		if err := partitionLimiter.Wait(ctx, "default", 1); err != nil {
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte("Timed out waiting for rate limit.\n"))
+			return
 		}
 		w.Write([]byte("Completed slow operation!\n"))
 	})
