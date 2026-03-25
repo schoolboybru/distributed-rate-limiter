@@ -3,6 +3,8 @@ package limiter
 import (
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 type CircuitState int
@@ -21,6 +23,7 @@ type CircuitBreaker struct {
 	timeout     time.Duration
 	lastFailure time.Time
 	clock       Clock
+	logger      zerolog.Logger
 }
 
 func NewCircuitBreaker(threshold int, timeout time.Duration, clock Clock) *CircuitBreaker {
@@ -29,6 +32,7 @@ func NewCircuitBreaker(threshold int, timeout time.Duration, clock Clock) *Circu
 		threshold: threshold,
 		timeout:   timeout,
 		clock:     clock,
+		logger:    zerolog.Nop(),
 	}
 }
 
@@ -42,6 +46,10 @@ func (cb *CircuitBreaker) Allow() bool {
 	case CircuitOpen:
 		if cb.clock.Now().Sub(cb.lastFailure) >= cb.timeout {
 			cb.state = CircuitHalfOpen
+			cb.logger.Info().
+				Str("from", circuitStateString(CircuitOpen)).
+				Str("to", circuitStateString(CircuitHalfOpen)).
+				Msg("circuit breaker state transition")
 			return true
 		}
 		return false
@@ -56,19 +64,36 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	prevState := cb.state
 	cb.failures = 0
 	cb.state = CircuitClosed
+
+	if prevState != CircuitClosed {
+		cb.logger.Info().
+			Str("from", circuitStateString(prevState)).
+			Str("to", circuitStateString(CircuitClosed)).
+			Msg("circuit breaker state transition")
+	}
 }
 
 func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	prevState := cb.state
 	cb.failures++
 	cb.lastFailure = cb.clock.Now()
 
 	if cb.failures >= cb.threshold {
-		cb.state = CircuitOpen
+		if cb.state != CircuitOpen {
+			cb.state = CircuitOpen
+			cb.logger.Warn().
+				Str("from", circuitStateString(prevState)).
+				Str("to", circuitStateString(CircuitOpen)).
+				Int("failures", cb.failures).
+				Int("threshold", cb.threshold).
+				Msg("circuit breaker state transition")
+		}
 	}
 }
 
@@ -77,4 +102,17 @@ func (cb *CircuitBreaker) State() CircuitState {
 	defer cb.mu.Unlock()
 
 	return cb.state
+}
+
+func circuitStateString(state CircuitState) string {
+	switch state {
+	case CircuitClosed:
+		return "closed"
+	case CircuitOpen:
+		return "open"
+	case CircuitHalfOpen:
+		return "half_open"
+	default:
+		return "unknown"
+	}
 }

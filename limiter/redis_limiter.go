@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 )
 
 //go:embed scripts/token_bucket.lua
@@ -29,6 +30,7 @@ type RedisLimiter struct {
 	refillRate     float64
 	keyPrefix      string
 	metrics        Metrics
+	logger         zerolog.Logger
 	failureMode    FailureMode
 	localLimiter   *KeyedLimiter
 	circuitBreaker *CircuitBreaker
@@ -48,9 +50,16 @@ func WithFailureMode(mode FailureMode) Option {
 	}
 }
 
+func WithLogger(logger zerolog.Logger) Option {
+	return func(r *RedisLimiter) {
+		r.logger = logger
+	}
+}
+
 func WithCircuitBreaker(threshold int, timeout time.Duration) Option {
 	return func(r *RedisLimiter) {
 		r.circuitBreaker = NewCircuitBreaker(threshold, timeout, RealClock{})
+		r.circuitBreaker.logger = r.logger.With().Str("component", "circuit_breaker").Logger()
 	}
 }
 
@@ -62,11 +71,16 @@ func NewRedisLimiter(client *redis.Client, capacity float64, refillRate float64,
 		refillRate:  refillRate,
 		keyPrefix:   keyPrefix,
 		metrics:     NoopMetrics{},
+		logger:      zerolog.Nop(),
 		failureMode: FailOpen,
 	}
 
 	for _, opt := range opts {
 		opt(r)
+	}
+
+	if r.circuitBreaker != nil {
+		r.circuitBreaker.logger = r.logger.With().Str("component", "circuit_breaker").Logger()
 	}
 
 	if r.failureMode == FailDegrade {
@@ -78,6 +92,9 @@ func NewRedisLimiter(client *redis.Client, capacity float64, refillRate float64,
 
 func (r *RedisLimiter) Allow(key string, tokens int) bool {
 	if r.circuitBreaker != nil && !r.circuitBreaker.Allow() {
+		r.logger.Warn().
+			Str("key", key).
+			Msg("circuit breaker open; using failure mode fallback")
 		r.metrics.OnError(key, ErrCircuitOpen)
 		return r.handleFailure(key, tokens)
 	}
@@ -89,6 +106,10 @@ func (r *RedisLimiter) Allow(key string, tokens int) bool {
 	r.metrics.OnLatency(key, time.Since(start))
 
 	if err != nil {
+		r.logger.Warn().
+			Str("key", key).
+			Err(err).
+			Msg("redis script execution failed; using failure mode fallback")
 		if r.circuitBreaker != nil {
 			r.circuitBreaker.RecordFailure()
 		}
@@ -132,15 +153,24 @@ func (r *RedisLimiter) Wait(ctx context.Context, key string, tokens int) error {
 }
 
 func (r *RedisLimiter) handleFailure(key string, tokens int) bool {
+	failureMode := failureModeString(r.failureMode)
+
 	switch r.failureMode {
 	case FailOpen:
+		r.logger.Debug().Str("key", key).Str("failure_mode", failureMode).Msg("failure mode applied")
 		r.metrics.OnAllow(key)
 		return true
 	case FailClosed:
+		r.logger.Debug().Str("key", key).Str("failure_mode", failureMode).Msg("failure mode applied")
 		r.metrics.OnDeny(key)
 		return false
 	case FailDegrade:
 		allowed := r.localLimiter.Allow(key, tokens)
+		r.logger.Debug().
+			Str("key", key).
+			Str("failure_mode", failureMode).
+			Bool("allowed", allowed).
+			Msg("failure mode applied")
 		if allowed {
 			r.metrics.OnAllow(key)
 		} else {
@@ -148,6 +178,20 @@ func (r *RedisLimiter) handleFailure(key string, tokens int) bool {
 		}
 		return allowed
 	default:
+		r.logger.Debug().Str("key", key).Str("failure_mode", "unknown").Msg("unknown failure mode; defaulting to allow")
 		return true
+	}
+}
+
+func failureModeString(mode FailureMode) string {
+	switch mode {
+	case FailOpen:
+		return "fail_open"
+	case FailClosed:
+		return "fail_closed"
+	case FailDegrade:
+		return "fail_degrade"
+	default:
+		return "unknown"
 	}
 }
